@@ -271,7 +271,7 @@ class SegmentationData(NuscData):
 
 
 def worker_rnd_init(x):
-    np.random.seed(13 + x)
+    np.random.seed(13 fFFff+ x)
 
 
 def compile_data(

@@ -142,10 +142,13 @@ class LiftSplatShoot(nn.Module):
         self.bx = nn.Parameter(bx, requires_grad=False)
         self.nx = nn.Parameter(nx, requires_grad=False)
 
-        self.downsample = 16
+        self.downsample = 16  # gap in pixels between frustum grid points in horizontal/vertical directions
         self.camC = 64
+        
+        # a template of frustum grid points to be later transformed by each cam's extrinsics/intrisics
         self.frustum = self.create_frustum()
         self.D, _, _, _ = self.frustum.shape
+
         self.camencode = CamEncode(self.D, self.camC, self.downsample)
         self.bevencode = BevEncode(inC=self.camC, outC=outC)
 
@@ -153,13 +156,23 @@ class LiftSplatShoot(nn.Module):
         self.use_quickcumsum = True
 
     def create_frustum(self):
+        """
+        Create a point grid in the camera view frustum.
+
+        This method generates a frustum grid by stacking image plane grids at different depths, based on the depth bounds specified in the `grid_conf`.
+
+        Returns:
+            nn.Parameter: A tensor representing the frustum with shape (D, H, W, 3),
+                          where D is the number of depth bins, H and W are the height
+                          and width of the frustum grid, and 3 represents the x, y, z coordinates.
+        """
         # make grid in image plane
-        ogfH, ogfW = self.data_aug_conf["final_dim"]
-        fH, fW = ogfH // self.downsample, ogfW // self.downsample
+        ogfH, ogfW = self.data_aug_conf["final_dim"]  # (128, 352)
+        fH, fW = ogfH // self.downsample, ogfW // self.downsample  # (8, 22) for downsample=16
         ds = (
             torch.arange(*self.grid_conf["dbound"], dtype=torch.float)
-            .view(-1, 1, 1)
-            .expand(-1, fH, fW)
+            .view(-1, 1, 1)  # look at the tensor as if it had 2 additional axes
+            .expand(-1, fH, fW)  # broadcast the arange into the height and width dimensions w/o additional memory allocation
         )
         D, _, _ = ds.shape
         xs = (
@@ -173,27 +186,36 @@ class LiftSplatShoot(nn.Module):
             .expand(D, fH, fW)
         )
 
-        # D x H x W x 3
+        # (D, H, W, 3)
         frustum = torch.stack((xs, ys, ds), -1)
         return nn.Parameter(frustum, requires_grad=False)
 
     def get_geometry(self, rots, trans, intrins, post_rots, post_trans):
-        """Determine the (x,y,z) locations (in the ego frame)
-        of the points in the point cloud.
-        Returns B x N x D x H/downsample x W/downsample x 3
+        """Determine the (x, y, z) locations of the points in the point cloud in the ego frame.
+
+        Args:
+            rots (torch.Tensor): Rotation matrices, part of the extrinsic camera parameters.
+            trans (torch.Tensor): Translation vectors, part of the extrinsic camera parameters.
+            intrins (torch.Tensor): Intrinsic camera parameters.
+            post_rots (torch.Tensor): Post-rotation matrices.
+            post_trans (torch.Tensor): Post-translation vectors.
+
+        Returns:
+            torch.Tensor: Point cloud locations with shape (B, N, D, H/downsample, W/downsample, 3).
         """
         B, N, _ = trans.shape
 
-        # undo post-transformation
-        # B x N x D x H x W x 3
-        points = self.frustum - post_trans.view(B, N, 1, 1, 1, 3)
+        # undo post-transformation  TODO: WTF is post-transformation?
+        # (B, N, D, H, W, 3)
+        points = self.frustum - post_trans.view(B, N, 1, 1, 1, 3)  # un-translate the points
         points = (
             torch.inverse(post_rots)
-            .view(B, N, 1, 1, 1, 3, 3)
-            .matmul(points.unsqueeze(-1))
+            .view(B, N, 1, 1, 1, 3, 3)  # one rotation matrix for each camera and batch sample
+            .matmul(points.unsqueeze(-1))  # un-rotate the points
         )
 
         # cam_to_ego
+        # [x*z, y*z, z]: points in the XY plane drift apart as we go further from the camera
         points = torch.cat(
             (
                 points[:, :, :, :, :, :2] * points[:, :, :, :, :, 2:3],
@@ -201,14 +223,31 @@ class LiftSplatShoot(nn.Module):
             ),
             5,
         )
-        combine = rots.matmul(torch.inverse(intrins))
+        # Inverse intrinsics transform from homogeneous to cartesian coordinates, while staying in the camera frame
+        # Extrinsic rotation of each camera in the ego frame; ego_SO3_camera
+        combine = rots.matmul(torch.inverse(intrins))  # (B, N, 3, 3)
+        # Maps points from camera homogenous frame to ego cartesian frame?
         points = combine.view(B, N, 1, 1, 1, 3, 3).matmul(points).squeeze(-1)
         points += trans.view(B, N, 1, 1, 1, 3)
 
         return points
 
     def get_cam_feats(self, x):
-        """Return B x N x D x H/downsample x W/downsample x C"""
+        """
+        Extract camera features from input tensor.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (B, N, C, H, W).
+
+        Returns:
+            torch.Tensor: Camera features of shape (B, N, D, H/downsample, W/downsample, C).
+                B: batch size
+                N: number of cameras
+                D: depth bins
+                H: height
+                W: width
+                C: number of channels
+        """
         B, N, C, imH, imW = x.shape
 
         x = x.view(B * N, C, imH, imW)
@@ -221,6 +260,17 @@ class LiftSplatShoot(nn.Module):
         return x
 
     def voxel_pooling(self, geom_feats, x):
+        """
+        Pool features from the same voxel together.
+        TODO: is this the "frustum pooling" from the paper?
+
+        Args:
+            geom_feats (torch.Tensor): Geometric features of shape (B, N, D, H/downsample, W/downsample, 3).
+            x (torch.Tensor): Input features of shape (B, N, D, H/downsample, W/downsample, C).
+
+        Returns:
+            torch.Tensor: Pooled features of shape (B, C, Z, X, Y).
+        """
         B, N, D, H, W, C = x.shape
         Nprime = B * N * D * H * W
 
@@ -278,15 +328,29 @@ class LiftSplatShoot(nn.Module):
         return final
 
     def get_voxels(self, x, rots, trans, intrins, post_rots, post_trans):
+        # (4, 6, 41, 8, 22, 3) TODO: WTF is 41, 8, 22?
         geom = self.get_geometry(rots, trans, intrins, post_rots, post_trans)
+        # (4, 6, 41, 8, 22, 64) TODO: WTF is 64? After passing through cam encoder.
         x = self.get_cam_feats(x)
 
+        # (4, 64, 200, 200)
         x = self.voxel_pooling(geom, x)
 
         return x
 
     def forward(self, x, rots, trans, intrins, post_rots, post_trans):
+        """
+        Args:
+            x: (B, N, C, H, W)
+            rots: (B, N, 3, 3)
+            trans: (B, N, 3)
+            intrins: (B, N, 3, 3)
+            post_rots: (B, N, 3, 3)
+            post_trans: (B, N, 3)
+        """
+        # (4, 64, 200, 200)
         x = self.get_voxels(x, rots, trans, intrins, post_rots, post_trans)
+        # (4, 1, 200, 200)
         x = self.bevencode(x)
         return x
 

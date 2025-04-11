@@ -280,14 +280,14 @@ def eval_model_iou(
     H=900,
     W=1600,
     resize_lim=(0.193, 0.225),
-    final_dim=(128, 352),
+    final_dim=(128, 352),  # height and width of input to the model, images are downsampled to this size?
     bot_pct_lim=(0.0, 0.22),
     rot_lim=(-5.4, 5.4),
     rand_flip=True,
-    xbound=[-50.0, 50.0, 0.5],
+    xbound=[-50.0, 50.0, 0.5],  # x discretization: from -50 to 50 meters, with 0.5 meter interval
     ybound=[-50.0, 50.0, 0.5],
     zbound=[-10.0, 10.0, 20.0],
-    dbound=[4.0, 45.0, 1.0],
+    dbound=[4.0, 45.0, 1.0],  # depth discretization: from 4 to 45 meters, with 1 meter interval
     bsz=4,
     nworkers=10,
 ):
@@ -431,12 +431,12 @@ def viz_model_preds(
             binimgs,
         ) in enumerate(loader):
             out = model(
-                imgs.to(device),
-                rots.to(device),
-                trans.to(device),
-                intrins.to(device),
-                post_rots.to(device),
-                post_trans.to(device),
+                imgs.to(device),  # (B, 6, C, H, W)
+                rots.to(device),  # (B, 6, 3, 3)
+                trans.to(device),  # (B, 6, 3)
+                intrins.to(device),  # (B, 6, 3, 3)
+                post_rots.to(device),  # (B, 6, 3, 3)
+                post_trans.to(device),  # (B, 6, 3)
             )
             out = out.sigmoid().cpu()
 
