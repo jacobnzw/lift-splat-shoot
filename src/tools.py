@@ -189,7 +189,22 @@ normalize_img = torchvision.transforms.Compose(
 
 
 def gen_dx_bx(xbound, ybound, zbound):
+    """
+    Generate discretization parameters for a 3D grid.
+
+    Args:
+        xbound (tuple): Bounds and step size for x-axis (min, max, step).
+        ybound (tuple): Bounds and step size for y-axis (min, max, step).
+        zbound (tuple): Bounds and step size for z-axis (min, max, step).
+
+    Returns:
+        tuple: 
+            dx (torch.Tensor): Step sizes for each axis.
+            bx (torch.Tensor): Minimum values for each axis.
+            nx (torch.LongTensor): Number of discretization steps for each axis.
+    """
     dx = torch.Tensor([row[2] for row in [xbound, ybound, zbound]])
+    # TODO: why + row[2] / 2.0? when it gets subtracted later in voxel pooling
     bx = torch.Tensor([row[0] + row[2] / 2.0 for row in [xbound, ybound, zbound]])
     nx = torch.LongTensor(
         [(row[1] - row[0]) / row[2] for row in [xbound, ybound, zbound]]
@@ -199,7 +214,25 @@ def gen_dx_bx(xbound, ybound, zbound):
 
 
 def cumsum_trick(x, geom_feats, ranks):
+    """
+    Perform a cumulative sum operation with a trick to handle repeated ranks.
+
+    This function computes the cumulative sum of 'x' while only keeping the last occurrence
+    of each unique rank. It then adjusts the cumulative sum to represent the sum for each
+    unique rank.
+
+    Args:
+        x (torch.Tensor): Input tensor to perform cumulative sum on.
+        geom_feats (torch.Tensor): Geometric features associated with each element in 'x'.
+        ranks (torch.Tensor): Tensor of ranks for each element in 'x'.
+
+    Returns:
+        tuple: A tuple containing:
+            - torch.Tensor: Adjusted cumulative sum of 'x' for each unique rank.
+            - torch.Tensor: Geometric features corresponding to the unique ranks.
+    """
     x = x.cumsum(0)
+    
     kept = torch.ones(x.shape[0], device=x.device, dtype=torch.bool)
     kept[:-1] = ranks[1:] != ranks[:-1]
 

@@ -143,7 +143,7 @@ class LiftSplatShoot(nn.Module):
         self.nx = nn.Parameter(nx, requires_grad=False)
 
         self.downsample = 16  # gap in pixels between frustum grid points in horizontal/vertical directions
-        self.camC = 64
+        self.camC = 64  # number of channels in the camera encoder output
         
         # a template of frustum grid points to be later transformed by each cam's extrinsics/intrisics
         self.frustum = self.create_frustum()
@@ -240,17 +240,18 @@ class LiftSplatShoot(nn.Module):
             x (torch.Tensor): Input tensor of shape (B, N, C, H, W).
 
         Returns:
-            torch.Tensor: Camera features of shape (B, N, D, H/downsample, W/downsample, C).
+            torch.Tensor: Camera features of shape (B, N, D, H/downsample, W/downsample, camC).
                 B: batch size
                 N: number of cameras
                 D: depth bins
                 H: height
                 W: width
-                C: number of channels
+                camC: number of camera encoder output channels
         """
         B, N, C, imH, imW = x.shape
 
         x = x.view(B * N, C, imH, imW)
+        # Run images through efficientnet
         x = self.camencode(x)
         x = x.view(
             B, N, self.camC, self.D, imH // self.downsample, imW // self.downsample
@@ -265,30 +266,36 @@ class LiftSplatShoot(nn.Module):
         TODO: is this the "frustum pooling" from the paper?
 
         Args:
-            geom_feats (torch.Tensor): Geometric features of shape (B, N, D, H/downsample, W/downsample, 3).
-            x (torch.Tensor): Input features of shape (B, N, D, H/downsample, W/downsample, C).
+            geom_feats (torch.Tensor): Frustum grid points in the ego frame of shape (B, N, D, H/downsample, W/downsample, 3).
+            x (torch.Tensor): Input features from camera encoder of shape (B, N, D, H/downsample, W/downsample, C).
 
         Returns:
             torch.Tensor: Pooled features of shape (B, C, Z, X, Y).
         """
-        B, N, D, H, W, C = x.shape
+        B, N, D, H, W, C = x.shape  # C: number of camera encoder output channels
         Nprime = B * N * D * H * W
 
         # flatten x
         x = x.reshape(Nprime, C)
 
-        # flatten indices
+        # Convert geometric features from world coordinates to voxel grid indices
+        # Subtract the minimum bound (self.bx) and half the voxel size (self.dx / 2.0) to center voxels
+        # Divide by voxel size (self.dx) to get indices, and convert to integer (long)
         geom_feats = ((geom_feats - (self.bx - self.dx / 2.0)) / self.dx).long()
         geom_feats = geom_feats.view(Nprime, 3)
+
+        # Create a batch index tensor (N * D * H * W, B)
         batch_ix = torch.cat(
             [
                 torch.full([Nprime // B, 1], ix, device=x.device, dtype=torch.long)
                 for ix in range(B)
             ]
         )
+        # Append the batch index to geom_feats
+        # This allows us to distinguish between voxels from different batches
         geom_feats = torch.cat((geom_feats, batch_ix), 1)
 
-        # filter out points that are outside box
+        # Filter out points that are outside the 3D voxel grid bounds
         kept = (
             (geom_feats[:, 0] >= 0)
             & (geom_feats[:, 0] < self.nx[0])
@@ -300,39 +307,48 @@ class LiftSplatShoot(nn.Module):
         x = x[kept]
         geom_feats = geom_feats[kept]
 
-        # get tensors from the same voxel next to each other
+        # Compute unique voxel ranks for each frustum grid point
         ranks = (
-            geom_feats[:, 0] * (self.nx[1] * self.nx[2] * B)
-            + geom_feats[:, 1] * (self.nx[2] * B)
-            + geom_feats[:, 2] * B
-            + geom_feats[:, 3]
+            geom_feats[:, 0] * (self.nx[1] * self.nx[2] * B)  # X coordinate contribution
+            + geom_feats[:, 1] * (self.nx[2] * B)  # Y coordinate contribution
+            + geom_feats[:, 2] * B  # Z coordinate contribution
+            + geom_feats[:, 3]  # Batch index contribution
         )
+        # Sort tensors based on ranks achieving the effect that features from the same voxel follow each other
         sorts = ranks.argsort()
         x, geom_feats, ranks = x[sorts], geom_feats[sorts], ranks[sorts]
 
-        # cumsum trick
+        # Aggregate features from the same voxel using cumulative sum
+        # x: (Nvox, C), geom_feats: (Nvox, 4), where Nvox is the number of non-empty voxels <= prod(self.nx)
         if not self.use_quickcumsum:
             x, geom_feats = cumsum_trick(x, geom_feats, ranks)
         else:
             x, geom_feats = QuickCumsum.apply(x, geom_feats, ranks)
 
-        # griddify (B x C x Z x X x Y)
+        # Griddify (B, C, Z, X, Y)
+        # geom_feats by now should be called "voxel coordinates"
+        # Fill in non-empty voxels, leave empty voxels as zeros
         final = torch.zeros((B, C, self.nx[2], self.nx[0], self.nx[1]), device=x.device)
         final[
             geom_feats[:, 3], :, geom_feats[:, 2], geom_feats[:, 0], geom_feats[:, 1]
         ] = x
 
-        # collapse Z
+        # Create 2D BEV grid by simply dropping the Z dimension: (B, C, Z, X, Y) -> (B, C, X, Y)
         final = torch.cat(final.unbind(dim=2), 1)
 
         return final
 
     def get_voxels(self, x, rots, trans, intrins, post_rots, post_trans):
-        # (4, 6, 41, 8, 22, 3) TODO: WTF is 41, 8, 22?
+        # Let Hd = H // downsample and Wd = W // downsample be sub-sampled cam image height and width
+        # The output shapes are as follows:
+        # Frustum grid points of each cam in the ego frame
+        # (B, N, D, Hd, Wd, 3) <=> (4, 6, 41, 8, 22, 3)
         geom = self.get_geometry(rots, trans, intrins, post_rots, post_trans)
-        # (4, 6, 41, 8, 22, 64) TODO: WTF is 64? After passing through cam encoder.
+        # (B, N, D, Hd, Wd, camC) <=> (4, 6, 41, 8, 22, 64); camC = cam encoder output channels
         x = self.get_cam_feats(x)
 
+        # For each 3D point of the frustum grid (geom) we now have a camC-dimensional feature vector (x)
+        # We can now project them into BEV grid using voxel pooling
         # (4, 64, 200, 200)
         x = self.voxel_pooling(geom, x)
 
